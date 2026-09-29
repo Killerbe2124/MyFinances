@@ -1,0 +1,28 @@
+# База данных SQLite (НИКОГДА не коммитить!)
+bot.db
+*.db
+*.db-journal
+*.db-wal
+
+# Файлы окружения с секретами (если будете использовать)
+.env
+.env.local
+
+# Скомпилированные бинарные файлы Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+MyFinance.exe
+
+# IDE и редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS файлы
+.DS_Store
+Thumbs.db
