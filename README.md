@@ -1,6 +1,5 @@
 Вот полный README.md файл для вашего проекта:
 
-```markdown
 # MyFinances
 
 Telegram-бот для учёта личных финансов на Go с хранением данных в SQLite.
