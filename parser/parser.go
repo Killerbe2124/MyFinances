@@ -10,20 +10,35 @@ import (
 	"unicode"
 )
 
+// OtherCategory — категория для трат, которые не удалось определить.
+const OtherCategory = "Другое"
+
 var (
 	ErrNoAmount  = errors.New("не нашёл сумму")
 	ErrBadAmount = errors.New("сумма должна быть больше нуля")
 )
 
+// Aliases — правила, которым бот научился у пользователя:
+// нормализованный текст (см. NormalizeKey), например "барбершоп" -> "Красота".
+type Aliases map[string]string
+
+// Entry — результат разбора одной строки.
 type Entry struct {
-	Amount   int64
+	Amount   int64 // в копейках
 	Category string
 	Comment  string
 	SpentAt  time.Time
+
+	// Unknown == true: категорию определить не удалось. Тогда Category == OtherCategory,
+	// а Comment хранит исходный текст — по нему бот спрашивает пользователя и учится.
+	Unknown bool
 }
 
+// Одно сообщение может содержать несколько трат: их разделяют перенос строки,
+// точка с запятой или запятая с пробелом (запятая без пробела — это "85,5").
 var splitRe = regexp.MustCompile(`[\n;]+|,\s+`)
 
+// Split разбивает сообщение на отдельные строки-траты.
 func Split(text string) []string {
 	var out []string
 	for _, p := range splitRe.Split(text, -1) {
@@ -34,32 +49,31 @@ func Split(text string) []string {
 	return out
 }
 
-var spaceThousandsRe = regexp.MustCompile(`(?:^|[^0-9.,])(\d{1,3}(?: \d{3})+)\b`)
-
-func normalizeThousands(line string) string {
-	return spaceThousandsRe.ReplaceAllStringFunc(line, func(m string) string {
-		if len(m) > 0 && (m[0] < '0' || m[0] > '9') {
-			return string(m[0]) + strings.ReplaceAll(m[1:], " ", "_")
-		}
-		return strings.ReplaceAll(m, " ", "_")
-	})
+// ParseLine разбирает одну трату по встроенному словарю категорий.
+// now — время сообщения в часовом поясе пользователя.
+func ParseLine(line string, now time.Time) (Entry, error) {
+	return ParseLineWith(line, now, nil)
 }
 
-func ParseLine(line string, now time.Time) (Entry, error) {
-	line = normalizeThousands(line)
+// ParseLineWith то же, что ParseLine, но сначала смотрит в правила пользователя (aliases):
+// они приоритетнее встроенного словаря.
+//
+// Понимает: "450 продукты", "такси 1200", "85,5 кофе", "300р кино",
+// "1.5к аренда", "500 подарок вчера", "500 подарок 25.09", "500 подарок 25.09.2026".
+func ParseLineWith(line string, now time.Time, aliases Aliases) (Entry, error) {
 	tokens := strings.Fields(line)
-	var cands []int
 
+	var cands []int
 	for i, t := range tokens {
 		if _, ok := parseAmount(t); ok {
 			cands = append(cands, i)
 		}
 	}
-
 	if len(cands) == 0 {
 		return Entry{}, ErrNoAmount
 	}
 
+	// Если чисел несколько, "25.09" похоже на дату — сумма это другое число.
 	amountIdx := cands[0]
 	if len(cands) > 1 {
 		amountIdx = cands[len(cands)-1]
@@ -79,7 +93,6 @@ func ParseLine(line string, now time.Time) (Entry, error) {
 	spent := now
 	dateFound := false
 	var words []string
-
 	for i, t := range tokens {
 		if i == amountIdx {
 			continue
@@ -93,42 +106,38 @@ func ParseLine(line string, now time.Time) (Entry, error) {
 		words = append(words, t)
 	}
 
-	category, comment := resolveCategory(strings.Join(words, " "))
-	return Entry{Amount: amount, Category: category, Comment: comment, SpentAt: spent}, nil
+	category, comment, unknown := resolveCategory(strings.Join(words, " "), aliases)
+	return Entry{Amount: amount, Category: category, Comment: comment, SpentAt: spent, Unknown: unknown}, nil
 }
 
-var amountRe = regexp.MustCompile(`^((?:\d{1,3}(?:[ _]\d{3})+)|\d{1,9})(?:[.,](\d{1,2}))?([кk])?$`)
+// ---- сумма ----
 
+// 450 | 85,5 | 12.50 | 300р | 1.5к | 100₽ | 20zł
+var amountRe = regexp.MustCompile(`^(\d{1,9})(?:[.,](\d{1,2}))?([кk])?(?:р|р\.|руб|руб\.|₽|zł|pln|usd|eur|\$|€)?$`)
+
+// parseAmount возвращает сумму в копейках.
 func parseAmount(tok string) (int64, bool) {
-	m := amountRe.FindStringSubmatch(tok)
+	m := amountRe.FindStringSubmatch(strings.ToLower(tok))
 	if m == nil {
 		return 0, false
 	}
-
-	wholeStr := strings.ReplaceAll(strings.ReplaceAll(m[1], " ", ""), "_", "")
-	whole, err := strconv.ParseInt(wholeStr, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-
+	whole, _ := strconv.ParseInt(m[1], 10, 64)
 	var frac int64
 	if m[2] != "" {
 		f := m[2]
 		if len(f) == 1 {
-			f += "0"
+			f += "0" // "85,5" = 85 руб 50 коп
 		}
-		frac, err = strconv.ParseInt(f, 10, 64)
-		if err != nil {
-			return 0, false
-		}
+		frac, _ = strconv.ParseInt(f, 10, 64)
 	}
-
 	total := whole*100 + frac
 	if m[3] != "" {
-		total *= 1000
+		total *= 1000 // "1.5к" = 1500
 	}
 	return total, true
 }
+
+// ---- дата ----
 
 var (
 	shortDateRe = regexp.MustCompile(`^(\d{1,2})\.(\d{1,2})$`)
@@ -151,6 +160,8 @@ func parseDate(tok string, now time.Time) (time.Time, bool) {
 	return parseShortDate(low, now)
 }
 
+// parseShortDate разбирает "25.09". Если такая дата в этом году ещё не наступила
+// (больше чем завтра), считаем, что имелся в виду прошлый год.
 func parseShortDate(tok string, now time.Time) (time.Time, bool) {
 	m := shortDateRe.FindStringSubmatch(tok)
 	if m == nil {
@@ -170,7 +181,7 @@ func makeDate(year int, dd, mm string, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	t := time.Date(year, time.Month(mo), d, 12, 0, 0, 0, now.Location())
-	if t.Day() != d || int(t.Month()) != mo {
+	if t.Day() != d || int(t.Month()) != mo { // например, 31.02
 		return time.Time{}, false
 	}
 	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
@@ -179,15 +190,17 @@ func makeDate(year int, dd, mm string, now time.Time) (time.Time, bool) {
 	return t, true
 }
 
+// ---- категория ----
+
 type rule struct {
 	category string
-	stems    []string
+	stems    []string // начала слов, в нижнем регистре, ё заменена на е
 }
 
 var rules = []rule{
 	{"Продукты", []string{"продукт", "еда", "магазин", "супермаркет", "пятероч", "магнит", "перекрест", "ашан", "овощ", "фрукт", "хлеб", "молок", "мясо", "рынок"}},
 	{"Кафе и рестораны", []string{"кафе", "кофе", "ресторан", "обед", "ужин", "завтрак", "пицц", "суши", "бургер", "макдон", "столов", "доставк"}},
-	{"Транспорт", []string{"такси", "убер", "uber", "bolt", "метро", "автобус", "трамвай", "маршрутк", "проезд", "бензин", "заправк", "парковк", "электричк", "поезд", "транспорт", "ехал", "поехал", "доехал"}},
+	{"Транспорт", []string{"такси", "убер", "uber", "bolt", "метро", "автобус", "трамвай", "маршрутк", "проезд", "бензин", "заправк", "парковк", "электричк", "поезд", "транспорт"}},
 	{"Жильё", []string{"аренд", "квартир", "коммунал", "жкх", "ипотек"}},
 	{"Связь и интернет", []string{"телефон", "связь", "интернет", "мобильн", "симк", "тариф"}},
 	{"Здоровье", []string{"аптек", "врач", "лекарств", "таблетк", "больниц", "клиник", "стоматолог", "анализ", "здоровь"}},
@@ -199,49 +212,100 @@ var rules = []rule{
 	{"Дом и быт", []string{"быт", "хозтовар", "ikea", "икеа", "уборк", "мебел", "посуд"}},
 }
 
+// DefaultCategories возвращает названия встроенных категорий (для кнопок выбора).
+func DefaultCategories() []string {
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		out[i] = r.category
+	}
+	return out
+}
+
 func norm(s string) string {
 	return strings.ReplaceAll(strings.ToLower(s), "ё", "е")
 }
 
-var bareCategory = map[string]bool{
-	"продукты": true,
-	"такси":    true,
-	"аренда":   true,
+// NormalizeKey приводит текст к виду, в котором хранятся и ищутся правила:
+// нижний регистр, "ё" -> "е", лишние пробелы и знаки по краям слов убраны.
+func NormalizeKey(text string) string {
+	var words []string
+	for _, w := range strings.Fields(norm(text)) {
+		if w = strings.Trim(w, ".,!?:;()\"'«»"); w != "" {
+			words = append(words, w)
+		}
+	}
+	return strings.Join(words, " ")
 }
 
-func resolveCategory(text string) (category, comment string) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return "Другое", ""
+// Learnable говорит, есть ли смысл запоминать такой текст как правило:
+// одно-три слова. Длинные фразы ("купил вафли для кота") больше не повторятся.
+func Learnable(key string) bool {
+	n := len(strings.Fields(key))
+	return n >= 1 && n <= 3
+}
+
+// CleanCategory приводит введённое пользователем название категории к аккуратному виду.
+// Возвращает "", если название пустое или это "Другое" (в неё правила не создаются).
+func CleanCategory(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	s = truncate(capitalize(s), 40)
+	if norm(s) == norm(OtherCategory) {
+		return ""
+	}
+	return s
+}
+
+// resolveCategory определяет категорию: сначала правила пользователя, потом встроенный словарь.
+// Если ничего не подошло — "Другое" с исходным текстом в комментарии и unknown == true.
+func resolveCategory(text string, aliases Aliases) (category, comment string, unknown bool) {
+	key := NormalizeKey(text)
+	if key == "" {
+		return OtherCategory, "", false
 	}
 
-	normText := norm(text)
-
-	for _, w := range strings.Fields(normText) {
-		w = strings.Trim(w, ".,!?:()\"'")
+	if cat, ok := lookupAlias(key, aliases); ok {
+		return cat, commentFor(text, key, cat), false
+	}
+	for _, w := range strings.Fields(key) {
 		for _, r := range rules {
 			for _, s := range r.stems {
 				if strings.HasPrefix(w, s) {
-					if normText == norm(r.category) || bareCategory[normText] {
-						return r.category, ""
-					}
-					return r.category, truncate(text, 200)
+					return r.category, commentFor(text, key, r.category), false
 				}
 			}
 		}
 	}
+	return OtherCategory, truncate(strings.TrimSpace(text), 200), true
+}
 
-	if len(strings.Fields(text)) <= 2 {
-		return truncate(capitalize(text), 40), ""
+// lookupAlias: точное совпадение всей фразы, иначе совпадение с любым отдельным словом.
+func lookupAlias(key string, aliases Aliases) (string, bool) {
+	if len(aliases) == 0 {
+		return "", false
 	}
+	if c, ok := aliases[key]; ok {
+		return c, true
+	}
+	for _, w := range strings.Fields(key) {
+		if c, ok := aliases[w]; ok {
+			return c, true
+		}
+	}
+	return "", false
+}
 
-	return "Другое", truncate(text, 200)
+// commentFor: если текст просто повторяет название категории, комментарий не нужен.
+func commentFor(text, key, category string) string {
+	if key == NormalizeKey(category) {
+		return ""
+	}
+	return truncate(strings.TrimSpace(text), 200)
 }
 
 func capitalize(s string) string {
-	if s == "" {
-		return ""
-	}
 	r := []rune(s)
 	r[0] = unicode.ToUpper(r[0])
 	return string(r)

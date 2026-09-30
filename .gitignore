@@ -3,6 +3,7 @@ bot.db
 *.db
 *.db-journal
 *.db-wal
+*.db-shm
 
 # Файлы окружения с секретами (если будете использовать)
 .env
@@ -26,3 +27,4 @@ MyFinance.exe
 # OS файлы
 .DS_Store
 Thumbs.db
+bugs.txt
